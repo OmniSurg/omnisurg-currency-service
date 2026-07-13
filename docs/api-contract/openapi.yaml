@@ -1,0 +1,405 @@
+openapi: 3.0.3
+info:
+  title: OmniSurg Currency Service
+  version: 0.1.0
+  description: >
+    Multi currency FX rates, conversion, and per tenant display currency
+    configuration for the OmniSurg platform. USD is the base reporting currency.
+    Rate snapshots are append only and shared platform wide; the per tenant FX
+    default is tenant scoped.
+servers:
+  - url: http://localhost:8092/api/v1/currency
+    description: Local stack
+tags:
+  - name: health
+  - name: rates
+  - name: convert
+  - name: config
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness and database reachability probe
+      tags: [health]
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: A dependency is unavailable
+      x-fr:
+        - "returns 200 with status ok when the database is reachable"
+      x-nfr:
+        latency_ms_p99: 50
+        rate_limit: "none"
+        auth_required: false
+        tenant_scoped: false
+
+  /rates/latest:
+    get:
+      operationId: getLatestRate
+      summary: Latest exchange rate for a currency pair
+      tags: [rates]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: base
+          required: true
+          schema:
+            type: string
+            example: USD
+        - in: query
+          name: quote
+          required: true
+          schema:
+            type: string
+            example: ZWG
+      responses:
+        '200':
+          description: Latest rate snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RateResponse'
+        '401':
+          description: Unauthorized
+        '404':
+          description: No snapshot for this pair
+        '422':
+          description: Unknown currency code
+      x-fr:
+        - "returns 200 with the most recent snapshot for the base and quote pair"
+        - "returns the reciprocal rate when only the inverse pair is stored"
+        - "returns 401 when the Authorization header is missing or expired"
+        - "returns 404 when no snapshot exists for the pair"
+        - "returns 422 when base or quote is not an active currency"
+        - "serves from the redis cache on the second call within the ttl window"
+      x-nfr:
+        latency_ms_p99: 50
+        rate_limit: "600/min/user"
+        auth_required: true
+        tenant_scoped: false
+        cache_ttl_seconds: 60
+
+  /convert:
+    post:
+      operationId: convertAmount
+      summary: Convert a minor unit amount between two currencies
+      tags: [convert]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConvertRequest'
+      responses:
+        '200':
+          description: Conversion result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConvertResponse'
+        '401':
+          description: Unauthorized
+        '404':
+          description: No rate available for the pair
+        '422':
+          description: Validation failure or unknown currency
+      x-fr:
+        - "returns 200 with the converted minor amount, applied rate, and captured_at"
+        - "applies spec rounding to the target currency decimals"
+        - "returns the same amount and rate 1 when from equals to"
+        - "computes a cross rate through USD when neither side is USD"
+        - "returns 401 when the Authorization header is missing or expired"
+        - "returns 422 when amount_minor is negative or a currency is unknown"
+        - "returns 404 when no rate snapshot supports the pair"
+      x-nfr:
+        latency_ms_p99: 50
+        rate_limit: "600/min/user"
+        auth_required: true
+        tenant_scoped: false
+        idempotency_required: false
+
+  /refresh:
+    post:
+      operationId: refreshRates
+      summary: Pull the latest rate from the upstream source and store a snapshot
+      tags: [rates]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '201':
+          description: Snapshot recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RateResponse'
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden, provider role required
+        '502':
+          description: Upstream rate source unavailable
+      x-fr:
+        - "returns 201 with the new snapshot pulled from the upstream source when caller is a provider"
+        - "returns 403 when a tenant role attempts a refresh"
+        - "returns 401 when the Authorization header is missing or expired"
+        - "returns 502 when the upstream source cannot be reached"
+        - "writes a currency.rate.refresh audit row"
+      x-nfr:
+        latency_ms_p99: 2000
+        rate_limit: "10/min/user"
+        auth_required: true
+        tenant_scoped: false
+        audit_action: "currency.rate.refresh"
+
+  /rates/manual:
+    post:
+      operationId: setManualRate
+      summary: Record a manual override rate for a pair
+      tags: [rates]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManualRateRequest'
+      responses:
+        '201':
+          description: Manual snapshot recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RateResponse'
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '422':
+          description: Validation failure
+      x-fr:
+        - "returns 201 with a manual source snapshot when caller is practice_admin"
+        - "returns 403 when a non admin role attempts an override"
+        - "returns 401 when the Authorization header is missing or expired"
+        - "returns 422 when the rate is not a positive decimal"
+        - "writes a currency.rate.manual_override audit row with the actor and timestamp"
+      x-nfr:
+        latency_ms_p99: 100
+        rate_limit: "60/min/user"
+        auth_required: true
+        tenant_scoped: false
+        audit_action: "currency.rate.manual_override"
+
+  /config:
+    get:
+      operationId: getTenantConfig
+      summary: The caller tenant's display currency and FX source
+      tags: [config]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Tenant FX configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigResponse'
+        '401':
+          description: Unauthorized
+      x-fr:
+        - "returns 200 with the caller tenant's display currency and fx source, defaulting when unset"
+        - "returns 401 when the Authorization header is missing or expired"
+        - "does not leak another tenant's configuration"
+      x-nfr:
+        latency_ms_p99: 50
+        rate_limit: "300/min/user"
+        auth_required: true
+        tenant_scoped: true
+    put:
+      operationId: updateTenantConfig
+      summary: Update the caller tenant's display currency and FX source
+      tags: [config]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateConfigRequest'
+      responses:
+        '200':
+          description: Updated configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigResponse'
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden, practice_admin required
+        '422':
+          description: Validation failure or unknown currency
+      x-fr:
+        - "returns 200 with the updated configuration when caller is practice_admin"
+        - "returns 403 when a non admin role attempts the update"
+        - "returns 401 when the Authorization header is missing or expired"
+        - "returns 422 when the display currency is not an active currency"
+        - "writes a currency.config.update audit row"
+      x-nfr:
+        latency_ms_p99: 100
+        rate_limit: "60/min/user"
+        auth_required: true
+        tenant_scoped: true
+        audit_action: "currency.config.update"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          type: object
+          properties:
+            status:
+              type: string
+            service:
+              type: string
+    RateResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          $ref: '#/components/schemas/Rate'
+    Rate:
+      type: object
+      required: [base, quote, rate, source, captured_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        base:
+          type: string
+        quote:
+          type: string
+        rate:
+          type: string
+          description: Quote units per one base unit, as a decimal string.
+        source:
+          type: string
+          enum: [zimrate, manual, seed]
+        captured_at:
+          type: string
+          format: date-time
+    ConvertRequest:
+      type: object
+      required: [amount_minor, from, to]
+      properties:
+        amount_minor:
+          type: integer
+          format: int64
+          description: Amount in the smallest unit of the from currency.
+        from:
+          type: string
+        to:
+          type: string
+    ConvertResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          $ref: '#/components/schemas/Conversion'
+    Conversion:
+      type: object
+      required: [from, to, amount_minor, converted_minor, rate, captured_at]
+      properties:
+        from:
+          type: string
+        to:
+          type: string
+        amount_minor:
+          type: integer
+          format: int64
+        converted_minor:
+          type: integer
+          format: int64
+        rate:
+          type: string
+        captured_at:
+          type: string
+          format: date-time
+    RefreshRequest:
+      type: object
+      properties:
+        base:
+          type: string
+          default: USD
+        quote:
+          type: string
+          default: ZWG
+    ManualRateRequest:
+      type: object
+      required: [base, quote, rate]
+      properties:
+        base:
+          type: string
+        quote:
+          type: string
+        rate:
+          type: string
+          description: Quote units per one base unit, as a decimal string.
+    ConfigResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          $ref: '#/components/schemas/Config'
+    Config:
+      type: object
+      required: [tenant_id, base_currency, display_currency, fx_source]
+      properties:
+        tenant_id:
+          type: string
+          format: uuid
+        base_currency:
+          type: string
+        display_currency:
+          type: string
+        fx_source:
+          type: string
+          enum: [zimrate, manual]
+        updated_at:
+          type: string
+          format: date-time
+    UpdateConfigRequest:
+      type: object
+      properties:
+        display_currency:
+          type: string
+        fx_source:
+          type: string
+          enum: [zimrate, manual]
